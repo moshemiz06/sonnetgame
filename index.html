@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <title>ECHO</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <style>
   html,body{margin:0;height:100%;background:#07070d;overflow:hidden}
   body{display:flex;align-items:center;justify-content:center}
-  canvas{display:block;touch-action:none;cursor:crosshair}
+  canvas{display:block;touch-action:none;cursor:crosshair;-webkit-user-select:none;user-select:none}
 </style>
 </head>
 <body>
@@ -15,13 +15,13 @@
 <script>
 // ECHO — every round you clear becomes a ghost that replays your exact moves. Don't touch yourself.
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
-const W = 800, H = 600;
-const R = 10, KILL = 2 * R - 4, ORB_R = 9;
-const NEED = 4;          // orbs to collect per round
-const LIMIT = 900;       // ticks per round (15s @ 60Hz)
-const INVULN = 45;       // ghosts are intangible for the first ticks of a round
+const W = 800, H = 600, DPR = Math.min(2, window.devicePixelRatio || 1);
+const R = 10, KILL = 2 * R - 4, GRAZE = KILL + 16, ORB_R = 9;
+const NEED = 4;                          // orbs to collect per round
+const LIMIT0 = 900, LIMIT_MIN = 600;     // ticks per round: 15s, shrinking to 10s
+const INVULN = 45;                       // ghosts are intangible for the first ticks of a round
 const SPEED = 3.4, DASH_SPEED = 10.5, DASH_TICKS = 9, DASH_CD = 50;
-cv.width = W; cv.height = H;
+cv.width = W * DPR; cv.height = H * DPR;
 
 function fit() {
   const s = Math.min(innerWidth / W, innerHeight / H);
@@ -32,19 +32,24 @@ addEventListener('resize', fit); fit();
 
 // ---------- state ----------
 let state = 'title';                 // title | play | dead
-let round = 1, ghosts = [], path = [], tick = 0, got = 0, orb = null;
+let round = 1, ghosts = [], path = [], tick = 0, got = 0, orb = null, limit = LIMIT0;
 let px = W / 2, py = H / 2, vx = 0, vy = 0, ix = 0, iy = 0;
 let dashT = 0, dashCd = 0, dashX = 0, dashY = 0;
+let score = 0, combo = 0, comboT = 0, inZone = [];
 let shake = 0, flash = 0, banner = 0, deadT = 0;
 let deathMsg = '', killer = -1, newBest = false;
-let best = 0;
-try { best = +localStorage.getItem('echo-best') || 0; } catch (e) {}
-const fx = [];
+let paused = false, muted = false, touch = false;
+let best = 0, bestScore = 0;
+try { best = +localStorage.getItem('echo-best') || 0; bestScore = +localStorage.getItem('echo-score') || 0; } catch (e) {}
+const fx = [], pops = [];
 
-function newGame() { ghosts = []; round = 1; state = 'play'; startRound(); }
+function newGame() { ghosts = []; round = 1; score = 0; state = 'play'; paused = false; startRound(); }
 function startRound() {
   px = W / 2; py = H / 2; vx = vy = 0; dashT = dashCd = 0;
-  path = []; tick = 0; got = 0; banner = 130; spawnOrb();
+  path = []; tick = 0; got = 0; banner = 130; combo = comboT = 0;
+  limit = Math.max(LIMIT_MIN, LIMIT0 - (round - 1) * 20);
+  inZone = ghosts.map(() => false);
+  spawnOrb();
 }
 function spawnOrb() {
   let x, y;
@@ -53,6 +58,9 @@ function spawnOrb() {
   orb = { x, y, t: 0 };
 }
 function endRound() {
+  const bonus = Math.floor((limit - tick) / 60) * 5;       // 5 points per second left
+  score += bonus;
+  pop(px, py - 26, bonus ? `CLEAR +${bonus}` : 'CLEAR', '#7aa2ff');
   ghosts.push(path);
   round++; flash = 1;
   [440, 554, 659].forEach((f, i) => setTimeout(() => beep(f, .18, 'triangle'), i * 80));
@@ -62,15 +70,15 @@ function die(why, k) {
   state = 'dead'; deadT = 0; shake = 18; killer = k;
   burst(px, py, '#ffffff', 40);
   beep(80, .5, 'sawtooth', .12);
-  const score = round - 1;
-  newBest = score > best;
-  if (newBest) { best = score; try { localStorage.setItem('echo-best', best); } catch (e) {} }
+  newBest = round - 1 > best || score > bestScore;
+  best = Math.max(best, round - 1); bestScore = Math.max(bestScore, score);
+  try { localStorage.setItem('echo-best', best); localStorage.setItem('echo-score', bestScore); } catch (e) {}
   deathMsg = why === 'time' ? 'OUT OF TIME' : `KILLED BY YOUR ROUND ${k + 1} SELF`;
 }
 
 // ---------- input ----------
 const keys = {};
-const ptr = { down: false, x: 0, y: 0 };
+const ptr = { down: false, id: -1, x: 0, y: 0 };
 function tryStart() { if (state === 'title' || (state === 'dead' && deadT > 45)) newGame(); }
 function dash() {
   if (dashCd > 0) return;
@@ -81,26 +89,45 @@ function dash() {
   dashX = dx / d; dashY = dy / d; dashT = DASH_TICKS; dashCd = DASH_CD;
   beep(300, .08, 'square', .04);
 }
+function autoPause() {
+  for (const k in keys) keys[k] = false;
+  ptr.down = false;
+  if (state === 'play') paused = true;
+}
+addEventListener('blur', autoPause);
+document.addEventListener('visibilitychange', () => { if (document.hidden) autoPause(); });
+
 addEventListener('keydown', e => {
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
   if (e.repeat) return;
   keys[e.code] = true; audio();
+  if (e.code === 'KeyM') muted = !muted;
+  if (paused) { if (['KeyP', 'Escape', 'Space', 'Enter'].includes(e.code)) paused = false; return; }
   if (state !== 'play') { if (e.code === 'Space' || e.code === 'Enter') tryStart(); return; }
+  if (e.code === 'KeyP' || e.code === 'Escape') { paused = true; return; }
   if (e.code === 'Space' || e.code === 'ShiftLeft' || e.code === 'ShiftRight') dash();
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
-function setPtr(e) {
+
+function toGame(e) {
   const r = cv.getBoundingClientRect();
-  ptr.x = (e.clientX - r.left) * W / r.width;
-  ptr.y = (e.clientY - r.top) * H / r.height;
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
 }
 cv.addEventListener('pointerdown', e => {
-  setPtr(e); audio();
+  audio();
+  if (e.pointerType === 'touch') touch = true;
+  if (paused) { paused = false; return; }
   if (state !== 'play') { tryStart(); return; }
-  if (e.button === 2) dash(); else ptr.down = true;
+  const p = toGame(e);
+  if (e.button === 2 || (touch && p.x > W - 130 && p.y > H - 130)) { dash(); return; }
+  ptr.x = p.x; ptr.y = p.y; ptr.down = true; ptr.id = e.pointerId;
 });
-cv.addEventListener('pointermove', setPtr);
-addEventListener('pointerup', () => { ptr.down = false; });
+addEventListener('pointermove', e => {
+  if (ptr.down && e.pointerId === ptr.id) { const p = toGame(e); ptr.x = p.x; ptr.y = p.y; }
+});
+function release(e) { if (e.pointerId === ptr.id) ptr.down = false; }
+addEventListener('pointerup', release);
+addEventListener('pointercancel', release);
 cv.addEventListener('contextmenu', e => e.preventDefault());
 
 // ---------- audio ----------
@@ -110,7 +137,7 @@ function audio() {
   if (ac && ac.state === 'suspended') ac.resume();
 }
 function beep(f, d = .1, type = 'sine', v = .08) {
-  if (!ac) return;
+  if (!ac || muted) return;
   const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
   o.type = type; o.frequency.value = f;
   g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(.001, t + d);
@@ -124,6 +151,8 @@ function burst(x, y, c, n) {
     fx.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, l: 1, c });
   }
 }
+function pop(x, y, s, c) { pops.push({ x, y, s, c, l: 1 }); }
+
 function step() {
   let ax = (keys.ArrowRight || keys.KeyD ? 1 : 0) - (keys.ArrowLeft || keys.KeyA ? 1 : 0);
   let ay = (keys.ArrowDown || keys.KeyS ? 1 : 0) - (keys.ArrowUp || keys.KeyW ? 1 : 0);
@@ -142,22 +171,33 @@ function step() {
   py = Math.max(R, Math.min(H - R, py + vy));
   path.push(px, py); tick++;
   orb.t++;
+  if (comboT > 0 && --comboT === 0) combo = 0;
 
   if (Math.hypot(px - orb.x, py - orb.y) < R + ORB_R) {
     burst(orb.x, orb.y, '#ffd24a', 16);
-    got++; beep(520 + got * 110, .12);
+    got++; score += 10; pop(orb.x, orb.y - 14, '+10', '#ffd24a'); beep(520 + got * 110, .12);
     if (got >= NEED) { endRound(); return; }
     spawnOrb();
   }
-  if (tick > INVULN) {
-    const i = tick - 1;
-    for (let k = 0; k < ghosts.length; k++) {
-      const g = ghosts[k];
-      if (i * 2 >= g.length) continue;
-      if (Math.hypot(g[2 * i] - px, g[2 * i + 1] - py) < KILL) { die('ghost', k); return; }
+
+  const i = tick - 1;
+  for (let k = 0; k < ghosts.length; k++) {
+    const g = ghosts[k];
+    if (i * 2 === g.length) burst(g[g.length - 2], g[g.length - 1], hue(k), 14);   // echo dissolves
+    if (i * 2 >= g.length) continue;
+    const d = Math.hypot(g[2 * i] - px, g[2 * i + 1] - py), near = d < GRAZE;
+    if (tick > INVULN) {
+      if (d < KILL) { die('ghost', k); return; }
+      if (near && !inZone[k]) {                    // skimmed past an echo: risk pays
+        combo++; comboT = 120;
+        const pts = 5 * Math.min(combo, 10);
+        score += pts; pop(px, py - 22, `GRAZE +${pts}`, hue(k));
+        beep(300 + combo * 50, .06, 'triangle', .05);
+      }
     }
+    inZone[k] = near;
   }
-  if (tick >= LIMIT) die('time');
+  if (tick >= limit) die('time');
 }
 function update() {
   for (let i = fx.length - 1; i >= 0; i--) {
@@ -165,7 +205,12 @@ function update() {
     p.x += p.vx; p.y += p.vy; p.vx *= .95; p.vy *= .95; p.l -= .025;
     if (p.l <= 0) fx.splice(i, 1);
   }
+  for (let i = pops.length - 1; i >= 0; i--) {
+    const p = pops[i]; p.y -= .5; p.l -= .018;
+    if (p.l <= 0) pops.splice(i, 1);
+  }
   shake *= .88; flash *= .92;
+  if (paused) return;
   if (banner > 0) banner--;
   if (state === 'dead') deadT++;
   if (state === 'play') step();
@@ -187,14 +232,12 @@ function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); }
 
 function drawWorld() {
   const i = Math.max(0, tick - 1);
-  // orb
   if (state === 'play') {
     const pulse = 1 + Math.sin(orb.t * .12) * .18;
     ctx.shadowColor = '#ffd24a'; ctx.shadowBlur = 20;
     ctx.fillStyle = '#ffd24a'; circle(orb.x, orb.y, ORB_R * pulse); ctx.fill();
     ctx.shadowBlur = 0;
   }
-  // ghosts
   ghosts.forEach((g, k) => {
     const n = g.length / 2;
     if (i >= n) return;                         // this echo has finished and faded out
@@ -213,7 +256,6 @@ function drawWorld() {
       circle(g[2 * i], g[2 * i + 1], R + 8 + Math.sin(deadT * .2) * 3); ctx.stroke();
     }
   });
-  // player trail + body
   if (path.length > 2) {
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.globalAlpha = .25;
     trace(path, Math.max(0, tick - 20), tick - 1); ctx.globalAlpha = 1;
@@ -241,7 +283,7 @@ function drawTitleBg() {
   }
 }
 function draw() {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = '#07070d'; ctx.fillRect(0, 0, W, H);
   ctx.save();
   if (shake > .5) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
@@ -255,6 +297,7 @@ function draw() {
   if (state === 'title') drawTitleBg(); else drawWorld();
   for (const p of fx) { ctx.globalAlpha = p.l; ctx.fillStyle = p.c; ctx.fillRect(p.x - 2, p.y - 2, 4, 4); }
   ctx.globalAlpha = 1;
+  for (const p of pops) text(p.s, p.x, p.y, 14, p.c, 'center', Math.min(1, p.l * 1.5));
   ctx.restore();
 
   if (flash > .02) { ctx.fillStyle = `rgba(255,255,255,${flash * .25})`; ctx.fillRect(0, 0, W, H); }
@@ -265,35 +308,52 @@ function draw() {
     text('ECHO', W / 2, 250, 96, '#fff'); ctx.shadowBlur = 0;
     text('every round you clear becomes a ghost.', W / 2, 305, 17, '#9fb0ff');
     text('it replays your exact moves. it will kill you.', W / 2, 330, 17, '#9fb0ff');
-    text('WASD / ARROWS move   ·   SPACE dash   ·   mouse: hold to steer, right-click dash', W / 2, 400, 13, '#6a789f');
-    text(`collect ${NEED} orbs before time runs out — finish fast and your echo is shorter`, W / 2, 424, 13, '#6a789f');
-    text('press SPACE or click to start', W / 2, 490, 20, '#fff', 'center', .6 + Math.sin(performance.now() / 300) * .4);
-    if (best) text(`BEST: ${best} rounds`, W / 2, 530, 14, '#ffd24a');
+    text('WASD / ARROWS move   ·   SPACE dash   ·   mouse: hold to steer, right-click dash', W / 2, 395, 13, '#6a789f');
+    text(`collect ${NEED} orbs before time runs out — finish fast and your echo is shorter`, W / 2, 418, 13, '#6a789f');
+    text('skim close past an echo for GRAZE combo points — but don\'t touch', W / 2, 441, 13, '#6a789f');
+    text('P pause   ·   M mute', W / 2, 464, 13, '#6a789f');
+    text(touch ? 'tap to start' : 'press SPACE or click to start', W / 2, 515, 20, '#fff', 'center', .6 + Math.sin(performance.now() / 300) * .4);
+    if (best) text(`BEST: ${best} rounds · ${bestScore} pts`, W / 2, 552, 14, '#ffd24a');
   }
   if (state === 'dead') {
     ctx.fillStyle = 'rgba(7,7,13,.72)'; ctx.fillRect(0, 0, W, H);
-    text(deathMsg, W / 2, 240, 34, '#ff4466');
-    text(`${round - 1} ROUND${round - 1 === 1 ? '' : 'S'} CLEARED`, W / 2, 300, 26, '#fff');
-    text(newBest ? 'NEW BEST!' : `BEST: ${best}`, W / 2, 340, 18, '#ffd24a');
-    if (deadT > 45) text('press SPACE to loop again', W / 2, 410, 18, '#fff', 'center', .6 + Math.sin(deadT * .1) * .4);
+    text(deathMsg, W / 2, 230, 34, '#ff4466');
+    text(`${round - 1} ROUND${round - 1 === 1 ? '' : 'S'} CLEARED`, W / 2, 290, 26, '#fff');
+    text(`SCORE ${score}`, W / 2, 328, 22, '#ffd24a');
+    text(newBest ? 'NEW BEST!' : `BEST: ${best} rounds · ${bestScore} pts`, W / 2, 364, 16, '#9fb0ff');
+    if (deadT > 45) text(touch ? 'tap to loop again' : 'press SPACE to loop again', W / 2, 430, 18, '#fff', 'center', .6 + Math.sin(deadT * .1) * .4);
+  }
+  if (paused) {
+    ctx.fillStyle = 'rgba(7,7,13,.78)'; ctx.fillRect(0, 0, W, H);
+    text('PAUSED', W / 2, 290, 48, '#fff');
+    text('press P / SPACE or click to resume', W / 2, 330, 16, '#9fb0ff');
   }
 }
 function hud() {
-  const used = tick / LIMIT, late = used > .8;
+  const used = tick / limit, late = used > .8;
   ctx.fillStyle = late ? (tick % 20 < 10 ? '#ff4466' : '#aa2244') : '#7aa2ff';
   ctx.fillRect(0, 0, W * (1 - used), 5);
   text(`ROUND ${round}`, 16, 32, 18, '#fff', 'left');
+  text(`SCORE ${score}`, 16, 54, 14, '#ffd24a', 'left');
+  if (combo > 1) text(`x${combo} GRAZE`, 16, 74, 14, '#ff9ad5', 'left', Math.min(1, comboT / 30));
   text(`ECHOES ${ghosts.length}`, W - 16, 32, 18, '#9fb0ff', 'right');
   for (let k = 0; k < NEED; k++) {
     ctx.fillStyle = k < got ? '#ffd24a' : 'rgba(255,210,74,.2)';
     circle(W / 2 + (k - (NEED - 1) / 2) * 24, 27, 7); ctx.fill();
   }
-  text(`BEST ${best}`, W - 16, H - 14, 13, '#6a789f', 'right');
+  text(`BEST ${best}  ·  ${bestScore} pts`, W - 16, H - 14, 13, '#6a789f', 'right');
+  if (muted) text('MUTED', 16, H - 14, 13, '#6a789f', 'left');
+  if (touch && state === 'play') {
+    ctx.fillStyle = dashCd > 0 ? 'rgba(255,255,255,.06)' : 'rgba(255,255,255,.16)';
+    circle(W - 65, H - 65, 40); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 2; ctx.stroke();
+    text('DASH', W - 65, H - 60, 14, '#fff', 'center', .8);
+  }
   if (state === 'play' && banner > 0) {
     const a = Math.min(1, banner / 40);
     text(`ROUND ${round}`, W / 2, 170, 44, '#fff', 'center', a);
     text(ghosts.length
-      ? `${ghosts.length} echo${ghosts.length > 1 ? 'es' : ''} replaying your past moves`
+      ? `${ghosts.length} echo${ghosts.length > 1 ? 'es' : ''} replaying your past moves  ·  ${Math.round(limit / 60)}s`
       : `collect ${NEED} orbs — then your moves become an echo`,
       W / 2, 200, 15, '#9fb0ff', 'center', a);
   }
